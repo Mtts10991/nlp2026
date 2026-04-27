@@ -1,2 +1,6 @@
 venv
 nlp2026/venv_comp_law
+.cache
+*.bin
+*.safetensors
+*.pt
