@@ -10,7 +10,8 @@ def legal_tokenizer(text):
    placeholder = {}
    protected_text = text
    for idx, kw in enumerate(sorted_keywords):
-       placeholder_token = f"__KW_{idx}__"
+       placeholder_token = ""
+    #    placeholder_token = f"__KW_{idx}__"
        placeholder[placeholder_token] = kw
        protected_text = protected_text.replace(kw, placeholder_token)
 
@@ -28,6 +29,77 @@ def legal_tokenizer(text):
     # tokens = legal_tokenizer(sample_text)
     # print(f"Original Text: {sample_text}")
     # print(f"Tokens: {tokens}")
+
+# การวัดค่า คาวมกำกวม (ambiguity) ของคำในบริบทกฎหมาย เทียบระหว่าง Dict และ Base+Regex
+def calculate_baseline_ambiguity(text):
+    matches = []
+    for key_word in LEGAL_KEYWORD:
+       for match in re.finditer(re.escape(key_word), text):
+           if match:
+               matches.append((match.start(), match.end(), key_word))
+           # ตรวจสอบการทับซ้อนของคำที่เป็น Overlap
+    overlaps = 0
+    for i in range(len(matches)):
+        for j in range(i + 1, len(matches)):
+            if matches[i][0] < matches[j][1] and matches[i][1] > matches[j][0]: # เนื่องจากเป็น array 2มิติ ต้องใช้ index 0 และ 1 เพื่อเข้าถึงตำแหน่งเริ่มต้นและสิ้นสุดของคำที่จับได้
+                overlaps += 1
+                # break  # นับแค่ครั้งเดียวต่อคำที่ทับซ้อน
+    return overlaps/len(matches) if matches else 0.0
+
+# ทดสอบรัน
+print(""*50)
+sample_text = "คดีการละเมิดสิทธิบัตรและเครื่องหมายการค้าในประเทศไทยมีความซับซ้อนมากขึ้น"
+tokens = legal_tokenizer(sample_text)
+print(f"Original Text: {sample_text}")
+print(f"Tokens: {tokens}")
+print(f"Baseline Ambiguity Score: {calculate_baseline_ambiguity(sample_text):.2f}")
+print(""*50)
+
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from transformers import pipeline
+# Load WangchanBERTa model สำหรับการทำ Token Classification
+model_name = "airesearch/wangchanberta-base-att-spm-uncased"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForTokenClassification.from_pretrained(model_name, num_labels=9)
+
+def berta_tokenizer(text):
+    # ใช้ WangchanBERTa tokenizer
+    tokenizer.tokenize(text)
+    return [t.replace("▁", "") for t in tokenizer.tokenize(text) if t.replace("▁", "")]  # ลบสัญลักษณ์พิเศษที่ WangchanBERTa ใช้
+
+# ทดสอบการวัด คำกำกวมด้วย WangchanBERTa tokenizer
+def analyze_refined_ambiguity(text, legaal_keywords):
+    text_tokens = berta_tokenizer(text)
+    frag_scores = []
+    for key_word in legaal_keywords:
+        if key_word not in text:
+            continue
+        # เปรียบเทียบ keyword กับการ tokenize ใน context ของ text จริง
+        # keyword ที่ "ไม่กำกวม" = ปรากฏเป็น token เดียวใน text
+        # keyword ที่ "กำกวม" = ถูกกลืนเข้าไปใน token อื่น หรือถูกแตกเป็นหลายชิ้น
+        if key_word in text_tokens:
+            fragment_ratio = 1.0  # ตรงกับ token เดียว → ไม่กำกวม
+        else:
+            # ไม่เจอ keyword ตรงๆ ใน text tokens → ถูกรวม/แตก → กำกวม
+            keyword_tokens = berta_tokenizer(key_word)
+            fragment_ratio = max(2.0, len(keyword_tokens) + 1.0)
+        frag_scores.append(fragment_ratio)
+    if not frag_scores:
+        return 0.0
+    avg_frag_score = sum(frag_scores) / len(frag_scores) - 1
+    return min(avg_frag_score, 1.0)
+
+# ทดสอบรัน
+print(""*50)
+sample_text = "คดีการละเมิดสิทธิบัตรและเครื่องหมายการค้าในประเทศไทยมีความซับซ้อนมากขึ้น"
+ambiguity_score = analyze_refined_ambiguity(sample_text, LEGAL_KEYWORD)
+print(f"Original Text: {sample_text}")
+print(f"Tokens: {berta_tokenizer(sample_text)}")
+print(f"Refined Ambiguity Score: {ambiguity_score:.2f}")
+print(""*50)
+
+
+
 
 #2 Context-aware Entity Extraction
 def extract_legal_entities(text):

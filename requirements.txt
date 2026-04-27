@@ -1,0 +1,10 @@
+numpy==2.4.4
+pythainlp==5.3.4
+attacut==1.0.6
+transformers==5.6.2
+scikit-learn==1.8.0
+imbalanced-learn==0.14.1
+torch==2.11.0
+sentencepiece==0.2.1
+protobuf==3.20.3
+tiktoken==0.3.3
