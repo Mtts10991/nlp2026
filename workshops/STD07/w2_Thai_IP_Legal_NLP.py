@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import seaborn as sns
 
-CLASS_NAMES = ['NO-INFRINGEMENT', 'INFRINGEMENT', 'COUNTERFEIT', 'PATENT', 'TRADEMARK', 'COPYRIGHT']
+CLASS_NAMES = ['NO-INFRINGEMENT', 'PATENT', 'COPYRIGHT']
+# CLASS_NAMES = ['NO-INFRINGEMENT', 'INFRINGEMENT', 'COUNTERFEIT', 'PATENT', 'TRADEMARK', 'COPYRIGHT']
 
 LEGAL_SYNONYMS = {
     "ละเมิด": ["ละเมิด", "ฝ่าฝืน", "ทำผิด"],
@@ -65,7 +66,8 @@ def balance_legal_data(INPUT, OUTPUT):
 
 INPUT = np.random.randn(60, 5)  # 60 ตัวอย่าง, 5 features
 # 6 คลาสไม่สมดุล (ตรงกับ CLASS_NAMES) เพื่อให้ SMOTE มี class ให้ balance
-OUTPUT = np.array([0]*20 + [1]*15 + [2]*10 + [3]*8 + [4]*5 + [5]*2)
+OUTPUT = np.array([0]*25 + [1]*20 + [2]*15)
+# OUTPUT = np.array([0]*20 + [1]*15 + [2]*10 + [3]*8 + [4]*5 + [5]*2)
 INPUT_RES, OUTPUT_RES = balance_legal_data(INPUT, OUTPUT) # ทดสอบรัน
 
 #3 BiLSTM-CRF (จำลองการใช้ BiLSTM-CRF สำหรับการทำ Named Entity Recognition ในเอกสารกฎหมาย)
@@ -113,7 +115,8 @@ def trainModelEvaluate(MODEL, NAME, INPUT, OUTPUT, ClassName):
     # Cost-Sensitive Weight (จำลองการใช้ Cost-Sensitive Weighting ในการฝึกโมเดลเพื่อจัดการกับปัญหาความไม่สมดุลของคลาสในเอกสารกฎหมาย) = FN (False Negatives) จะมีค่าเสียหายสูงกว่า FP (False Positives) ในการจำแนกประเภทเอกสารกฎหมาย เช่น การจำแนกว่าข้อความเป็น "ละเมิด" หรือไม่ ถ้าโมเดลพลาดการจำแนกข้อความที่เป็น "ละเมิด" (False Negative) อาจส่งผลให้เกิดความเสียหายทางกฎหมายหรือการสูญเสียทางการเงิน ในขณะที่การจำแนกข้อความที่ไม่ใช่ "ละเมิด" เป็น "ละเมิด" (False Positive) อาจทำให้เกิดความไม่สะดวกหรือความผิดพลาดในการจัดการเอกสาร แต่จะไม่ส่งผลเสียหายเท่ากับ False Negatives ดังนั้น การใช้ Cost-Sensitive Weighting เพื่อเพิ่มน้ำหนักให้กับ False Negatives จะช่วยให้โมเดลมีความระมัดระวังมากขึ้นในการจำแนกข้อความที่เป็น "ละเมิด" และลดโอกาสในการพลาดการจำแนกข้อความที่สำคัญในเอกสารกฎหมาย
 
     # ให้ Class 0 (NO-INFRINGEMENT) น้ำหนักต่ำสุด, ที่เหลือให้น้ำหนักสูงเพื่อลด False Negative
-    WEIGHTS = torch.tensor([1.0, 2.0, 2.0, 2.0, 2.0, 2.0])
+    WEIGHTS = torch.tensor([1.0, 2.0, 2.0])
+    # WEIGHTS = torch.tensor([1.0, 2.0, 2.0, 2.0, 2.0, 2.0])
 
     CRITERION = neural_network.CrossEntropyLoss(weight=WEIGHTS) # ใช้ CrossEntropyLoss พร้อมกับ Cost-Sensitive Weighting เพื่อช่วยให้โมเดลมีความระมัดระวังมากขึ้นในการจำแนกข้อความที่เป็น "ละเมิด" และลดโอกาสในการพลาดการจำแนกข้อความที่สำคัญในเอกสารกฎหมาย
 
@@ -163,4 +166,4 @@ BILSTM_MODEL = LegalBiLSTM(input_dimension=NUM_FEATURES, output_dimension=len(CL
 print(f"Input Shape for LSTM: {INPUT_RES.shape}, Output Shape: {OUTPUT_RES.shape}")
 
 trainModelEvaluate(LSTM_MODEL, "Unidirectional LSTM", INPUT_TENSOR, OUTPUT_TENSOR, CLASS_NAMES)
-trainModelEvaluate(BILSTM_MODEL, "Bidirectional LSTM", INPUT_TENSOR, OUTPUT_TENSOR, CLASS_NAMES)
+# trainModelEvaluate(BILSTM_MODEL, "Bidirectional LSTM", INPUT_TENSOR, OUTPUT_TENSOR, CLASS_NAMES)

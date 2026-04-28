@@ -1,0 +1,1 @@
+print(f"  {tfidf_matrix.shape}")
