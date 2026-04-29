@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-
+# SinusoidalPositionEncoding = คลาสที่สร้าง position encoding ตามสูตรของ Vaswani et al. (2017)
 class SinusoidalPositionEncoding:
     def __init__(self, d_model=16, max_len=10):
         # d_model = ขนาดของ embedding vector ของแต่ละคำ (ในที่นี้ใช้ 16 เพื่อให้ดูง่าย)
@@ -65,9 +65,9 @@ class SinusoidalPositionEncoding:
     # แสดงผลแบบ tensor (default ของ PyTorch) — เหมาะกับการ debug
     # -------------------------------------------------------------------------
     def show_position_encoding(self, seq_len=10):
-        print("" *70)
+        print("-" * 70)
         print(f"Position Encoding for sequence length {seq_len} tokens (shape: {self.pe.shape}):")
-        print("" *70)
+        print("-" * 70)
         for position in range(seq_len):
             print(f"Position :: {position}: {self.pe[0, position, :]}")
         return self.pe
@@ -247,9 +247,214 @@ if __name__ == "__main__":
         return weights @ value, weights
         
     # จำลองข้อมูล 1 ประโยค 3 tokens, vector size 4, 2 heads
-    query = key = value = np.random.random((1, 2, 3, 4))  # shape (batch_size=1, num_heads=2, seq_len=3, d_k=4
+    query = key = value = np.random.random((1, 2, 3, 4))  # shape (batch_size=1, num_heads=2, seq_len=3, d_k=4)
     output, weights = scaled_dot_product_attention(query, key, value)
-    print("" * 70)
-    print(f" Attention Weights 3 X 3 Matrixs")
-    print(weights[0].round(3))  # แสดง weight matrix ของ head 0 (shape 3x3)
-    print("" * 70)
+    print("-" * 70)
+    print(" Attention Weights (head 0) - shape 3 x 3 (seq_len x seq_len)")
+    print(weights[0, 0].round(3))  # weights shape: (batch, heads, seq_len, seq_len) - head 0
+    print("-" * 70)
+
+
+
+# =============================================================================
+# 3) Multi-Head Attention (การรวมหลายหัว attention เพื่อจับ pattern หลากหลาย)
+# -----------------------------------------------------------------------------
+# แทนที่จะคำนวณ attention เพียงรอบเดียว เราซอย vector ออกเป็นหลาย "หัว" (heads)
+# แต่ละหัวเรียนรู้มองคำในมุมที่ต่างกัน เช่น:
+#   - หัว 1: ความสัมพันธ์เชิงไวยากรณ์ (subject-verb)
+#   - หัว 2: ความใกล้ทางความหมาย
+#   - หัว 3: ตำแหน่งสัมพัทธ์ (ใกล้/ไกล)
+#   - หัว 4: pattern ที่ยังไม่รู้ล่วงหน้า (โมเดลค้นเอง)
+# แล้วเอาผลของทุกหัวมารวมกัน → ได้ representation ที่หลากหลายกว่า single-head
+# =============================================================================
+
+class MultiHeadAttention():
+    """
+    Multi-Head Attention (numpy version)
+    ทำงาน 4 ขั้นตอน:
+      1) project input → Q, K, V ด้วย weight matrices
+      2) splitHeads: ซอย vector เป็นหลายหัว
+      3) ทำ scaled_dot_product_attention ในทุกหัวพร้อมกัน (vectorized)
+      4) combineHeads: รวมผลลัพธ์กลับ แล้วผ่าน W_o
+    """
+    def __init__(self, d_model=16, num_heads=4):
+        # d_model    = ขนาด embedding ของแต่ละคำ (ต้องหาร num_heads ลงตัว)
+        # num_heads  = จำนวนหัว attention
+        # d_k        = ขนาดของแต่ละหัว = d_model / num_heads
+        self.d_model = d_model
+        self.num_heads = num_heads
+        assert d_model % num_heads == 0, "d_model ต้องหารด้วย num_heads ลงตัว"
+        self.d_k = int(d_model // num_heads)  # การหารจำนวนเต็ม เศษตัดทิ้ง
+
+        # weight matrices สำหรับ Q, K, V และ output projection
+        # ใช้ numpy เพื่อให้สอดคล้องกับ scaled_dot_product_attention และ test data
+        # คูณ 0.1 = scale ลงเพื่อให้ค่าเริ่มต้นไม่ใหญ่เกินไป (mimic Xavier init แบบง่าย)
+        np.random.seed(42)
+        self.W_q = np.random.randn(d_model, d_model) * 0.1  # Query projection
+        self.W_k = np.random.randn(d_model, d_model) * 0.1  # Key projection
+        self.W_v = np.random.randn(d_model, d_model) * 0.1  # Value projection
+        self.W_o = np.random.randn(d_model, d_model) * 0.1  # Output projection (รวมหัว)
+
+    def splitHeads(self, x):
+        # ซอย d_model ออกเป็น num_heads หัว แต่ละหัวขนาด d_k
+        # x shape:   (batch, seq_len, d_model)
+        #   reshape: (batch, seq_len, num_heads, d_k)
+        #   transpose(0,2,1,3) → (batch, num_heads, seq_len, d_k)
+        # เหตุผลที่เอา num_heads ขึ้นมาก่อน seq_len:
+        #   เพื่อให้ Q @ K^T ใน attention เกิดในแต่ละหัวอิสระจากกัน
+        batch_size, seq_len, _ = x.shape
+        return x.reshape(batch_size, seq_len, self.num_heads, self.d_k).transpose(0, 2, 1, 3)
+
+    def combineHeads(self, x):
+        # ทำผกผันกับ splitHeads (รวมผลลัพธ์จากทุกหัวกลับเป็น d_model)
+        # x shape:   (batch, num_heads, seq_len, d_k)
+        #   transpose(0,2,1,3) → (batch, seq_len, num_heads, d_k)
+        #   reshape: (batch, seq_len, num_heads * d_k) = (batch, seq_len, d_model)
+        batch_size, _, seq_len, _ = x.shape
+        return x.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.num_heads * self.d_k)
+
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, d_model) — เป็น numpy array
+
+        # ----- Step 1: สร้าง Q, K, V จาก input x -----
+        # ใช้ matmul กับ weight matrices (ตามที่ครูสอน)
+        # ผลลัพธ์ shape: (batch_size, seq_len, d_model)
+        Q = np.matmul(x, self.W_q)
+        K = np.matmul(x, self.W_k)
+        V = np.matmul(x, self.W_v)
+
+        # ----- Step 2: แบ่ง Q, K, V ออกเป็นหลายหัว -----
+        # ผลลัพธ์ shape: (batch_size, num_heads, seq_len, d_k)
+        Q = self.splitHeads(Q)
+        K = self.splitHeads(K)
+        V = self.splitHeads(V)
+
+        # ----- Step 3: คำนวณ attention พร้อมกันทุกหัว (vectorized) -----
+        # scaled_dot_product_attention รองรับ batch dim หลายชั้นอยู่แล้ว
+        # → ไม่ต้อง for loop ทีละหัว (เร็วกว่ามาก)
+        # attn_output shape:  (batch_size, num_heads, seq_len, d_k)
+        # attn_weights shape: (batch_size, num_heads, seq_len, seq_len)
+        attn_output, attn_weights = scaled_dot_product_attention(Q, K, V)
+
+        # ----- Step 4: รวมผลลัพธ์จากทุกหัว แล้วผ่าน W_o -----
+        # combined shape: (batch_size, seq_len, d_model)
+        combined = self.combineHeads(attn_output)
+        output = np.matmul(combined, self.W_o)
+        return output, attn_weights
+
+# ทดสอบรัน จำลอง Input Size 16D แบ่งเป็น 4 Head, Head ละ 4 Dimension
+InputData = np.random.randn(1, 5, 16)
+mha = MultiHeadAttention()
+heads = mha.splitHeads(InputData)
+print("-" * 70)
+print(f"- Origin Shape: {InputData.shape} \n- Heads Shape : {heads.shape} (Batch, Head, Seq_len, Depth)")
+print("-" * 70)
+
+# =============================================================================
+# อธิบายแบบเข้าใจง่าย: ทำไม Shape ถึงเป็นแบบนี้
+# =============================================================================
+#
+# 🔹 Origin Shape: (1, 5, 16)  ← มาจาก np.random.randn(1, 5, 16)
+#   - 1  = batch_size  → มี 1 ประโยค (1 ก้อนข้อมูล)
+#   - 5  = seq_len     → ประโยคนี้มี 5 คำ (5 tokens)
+#   - 16 = d_model     → แต่ละคำถูกแปลงเป็น vector ขนาด 16 มิติ
+#   เปรียบเทียบ: เหมือนตาราง 5 แถว (คำ) × 16 คอลัมน์ (ความหมายของคำ)
+#
+# 🔹 Heads Shape: (1, 4, 5, 4)  ← หลังผ่าน splitHeads()
+#   - 1 = batch_size   → ยังเป็น 1 ประโยคเหมือนเดิม
+#   - 4 = num_heads    → ซอย vector 16 มิติ ออกเป็น 4 หัว (heads)
+#   - 5 = seq_len      → ยังคง 5 คำเหมือนเดิม
+#   - 4 = d_k          → แต่ละหัวถือ vector ขนาด 4 มิติ (16 ÷ 4 = 4)
+#
+# 🔹 ขั้นตอนการแปลงร่าง (reshape + transpose):
+#   (1, 5, 16)
+#       │  reshape เป็น (batch, seq_len, num_heads, d_k)
+#       ▼
+#   (1, 5, 4, 4)         ← แบ่ง 16 มิติ → 4 หัว × 4 มิติ
+#       │  transpose(0, 2, 1, 3)  สลับแกน seq_len ↔ num_heads
+#       ▼
+#   (1, 4, 5, 4)         ← (Batch, Head, Seq_len, Depth)
+#
+# 🔹 ทำไมต้องสลับให้ Head มาก่อน Seq_len?
+#   เพราะตอนคำนวณ attention เราต้องการให้ "แต่ละหัว" ทำงาน
+#   อิสระกับคำทั้ง 5 คำ → เลยจัดให้ head เป็นแกนนอกสุด
+#   เพื่อให้ Q @ K^T เกิดขึ้นภายในหัวเดียวกัน ไม่ปนข้ามหัว
+#
+# 🔹 อุปมา: เหมือนแบ่งทีมนักสืบ 4 คน ดูประโยคเดียวกัน
+#   แต่ละคนสนใจมุมที่ต่างกัน (ไวยากรณ์ / อารมณ์ / ความสัมพันธ์ ฯลฯ)
+#   แล้วค่อยเอาผลลัพธ์มารวมกันตอนท้าย
+
+# =============================================================================
+# รวม Positional Encoding + Multi-Head Attention เข้าด้วยกัน (mini pipeline)
+# =============================================================================
+d_model = 16
+num_heads = 4
+seq_len = 5
+batch = 1
+
+# Step 1: สุ่ม token embeddings (จำลอง embedding ของ 5 คำ)
+np.random.seed(0)
+token_embeddings = np.random.randn(batch, seq_len, d_model)
+
+# Step 2: บวกกับ Positional Encoding เพื่อ "ฉีด" ข้อมูลตำแหน่งเข้าไป
+position_Encoding = SinusoidalPositionEncoding(d_model=d_model, max_len=10)
+position_Encoding.show_position_encoding(seq_len=seq_len)
+# pe เป็น torch tensor shape (1, max_len, d_model) → แปลงเป็น numpy + slice ตามจำนวนคำจริง
+pe_np = position_Encoding.pe.detach().numpy()[:, :seq_len, :]  # shape (1, seq_len, d_model)
+Input = token_embeddings + pe_np
+
+# Step 3: ส่งเข้า Multi-Head Attention
+mha = MultiHeadAttention(d_model=d_model, num_heads=num_heads)
+output, attn_weights = mha.forward(Input)
+
+print("-" * 70)
+print(f"Input shape         : {Input.shape}          (batch, seq_len, d_model)")
+print(f"Output shape        : {output.shape}          (batch, seq_len, d_model)")
+print(f"Attn weights shape  : {attn_weights.shape}    (batch, num_heads, seq_len Q , seq_len k)")
+print("-" * 70)
+
+# -----------------------------------------------------------------------------
+# แสดง attention weight ของแต่ละหัวแยกกัน
+# -----------------------------------------------------------------------------
+# attn_weights shape: (batch, num_heads, seq_len, seq_len)
+# - แถว i = "คำที่ i" กำลังให้ความสนใจ (query)
+# - คอลัมน์ j = "คำที่ j" ที่ถูกมอง (key)
+# - ค่า [i, j] = ความสนใจของคำ i ที่มีต่อคำ j (รวมแต่ละแถว = 1)
+#
+# การแสดงทีละหัวช่วยให้เห็นว่า "แต่ละหัวสนใจคนละ pattern"
+# (ในตัวอย่างนี้ weight ยังกระจายค่อนข้างเท่ากัน เพราะ W_q/W_k/W_v เป็นค่าสุ่ม
+#  ยังไม่ได้ train — ของจริงแต่ละหัวจะมี pattern แตกต่างกันชัดเจน)
+# -----------------------------------------------------------------------------
+words = ["I", "love", "NLP", "and", "!"]  # ตัวอย่างคำสำหรับ 5 ตำแหน่ง
+
+print("Attention Weights per Head  (each row sums to 1)")
+print("Row = Query (the word looking) | Col = Key (the word being looked at)")
+print("=" * 70)
+
+for h in range(num_heads):
+    head_weight = attn_weights[0, h].round(3)  # shape (seq_len, seq_len)
+
+    print(f"\n[ Head {h} ]")
+    # หัวตาราง: ชื่อคำเป็น Key (คอลัมน์)
+    header = "        " + "".join([f"{w:>8}" for w in words])
+    print(header)
+    print("        " + "-" * (8 * len(words)))
+
+    # แต่ละแถว: ชื่อคำเป็น Query
+    for i, w in enumerate(words):
+        row_str = f"{w:>6} |" + "".join([f"{v:>8.3f}" for v in head_weight[i]])
+        print(row_str)
+
+print("=" * 70)
+
+# Tranformer Endcoder (BERT) and Decode (GPT)
+class FeedForWard:
+    def __init__(self, d_model, dimention_feedforward=None, seed=42):
+        rng = np.random.RandomState(seed)
+        dimention_feedforward = dimention_feedforward or d_model * 4
+        s = np.sqrt(2.0 / d_model)
+        s = np.sqrt(2.0 / d_model)
+        self.W1 = rng.randn(dimention_feedforward, d_model) * s       # (dimention_feedforward, d_model)
+        self.b1 = np.zeros(dimention_feedforward)
+        self.W2 = rng.randn(d_model, dimention_feedforward) * s       # (d_model, dimention_feedforward)
+        self.b2 = np.zeros(d_model)
