@@ -19,11 +19,15 @@
 #   PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
 # =============================================================================
 
+from operator import concat
+from docutils.nodes import important
 import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 # SinusoidalPositionEncoding = คลาสที่สร้าง position encoding ตามสูตรของ Vaswani et al. (2017)
 class SinusoidalPositionEncoding:
     def __init__(self, d_model=16, max_len=10):
@@ -132,6 +136,9 @@ class SinusoidalPositionEncoding:
 
         plt.tight_layout()
         plt.show()
+
+    def layer_norm(self, x):
+        return (x - x.mean()) / (x.std() + 1e-6)
 
     # -------------------------------------------------------------------------
     # forward() = นำ position encoding ไปบวกกับ embedding ของคำ
@@ -313,7 +320,63 @@ class MultiHeadAttention():
         batch_size, _, seq_len, _ = x.shape
         return x.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.num_heads * self.d_k)
 
-    def forward(self, x):
+    def layer_norm(self, x):
+        return (x-x.mean())/(x.std() + 1e-6)
+
+    def forward(self, x, padding_mask=None, causal_mask=None, return_weights=False):
+        """
+        เมธอด Forward ที่รองรับทั้ง Input แบบ 2D (Seq, Dim) และ 3D (Batch, Seq, Dim)
+        และส่งค่ากลับ 2 อย่าง (output, weights) เพื่อให้รองรับโค้ดดั้งเดิมในไฟล์นี้
+        """
+        # 1. จัดการมิติ Input: รองรับทั้ง 2D (4, 16) และ 3D (1, 4, 16)
+        is_2d = (x.ndim == 2)
+        if is_2d:
+            x = x[np.newaxis, ...] # เพิ่มมิติ Batch ชั่วคราวเพื่อให้คำนวณแบบสากลได้
+
+        # 2. Pre-Norm: ทำ normalization ก่อนเข้า Layer (LayerNorm style)
+        x_norm = (x - x.mean(axis=-1, keepdims=True)) / (x.std(axis=-1, keepdims=True) + 1e-6)
+
+        head_outputs = []
+        head_weights = []
+        for i in range(self.num_heads):
+            # 3. Slicing Weights: ดึงส่วนประกอบของแต่ละหัว (Head) ออกมาหัวละ 4 มิติ (จากทั้งหมด 16)
+            start = i * self.d_k
+            end = (i + 1) * self.d_k
+            
+            # Projection: x_norm (B, S, 16) @ W (16, 4) -> (B, S, 4)
+            Q_h = x_norm @ self.W_q[:, start:end]
+            K_h = x_norm @ self.W_k[:, start:end]
+            V_h = x_norm @ self.W_v[:, start:end]
+            
+            # 4. Attention: คำนวณความสัมพันธ์ภายในหัวนั้นๆ
+            # เพิ่มมิติ Head [:, np.newaxis] เพื่อให้ฟังก์ชันรับค่าได้ (Batch, Head, Seq, d_k)
+            attn_h, weight_h = scaled_dot_product_attention(Q_h[:, np.newaxis, ...], 
+                                                          K_h[:, np.newaxis, ...], 
+                                                          V_h[:, np.newaxis, ...],
+                                                          mask=causal_mask)
+            
+            head_outputs.append(attn_h[:, 0, :, :]) # เก็บผลลัพธ์ (B, S, 4)
+            head_weights.append(weight_h)           # เก็บน้ำหนัก (B, 1, S, S)
+
+        # 5. Concatenate & Output Projection: รวมทุกหัวกลับเป็น 16 มิติ แล้วผ่าน W_o
+        concat = np.concatenate(head_outputs, axis=-1)
+        output = concat @ self.W_o
+
+        # 6. Residual Connection: บวก Input เดิมกลับเข้าไป
+        final_output = output + x
+        
+        # รวมน้ำหนักจากทุกหัวเข้าด้วยกัน: (Batch, num_heads, Seq, Seq)
+        all_weights = np.concatenate(head_weights, axis=1)
+
+        # 7. กลับมิติเดิมหากตอนแรกส่งมาเป็น 2D
+        if is_2d:
+            final_output = final_output[0]
+            all_weights = all_weights[0]
+
+        # 8. คืนค่า 2 อย่างเสมอ: เพื่อให้โค้ดส่วนอื่นที่เขียนว่า 'out, weights = mha.forward(...)' ไม่พัง
+        return final_output, all_weights
+
+            
         # x shape: (batch_size, seq_len, d_model) — เป็น numpy array
 
         # ----- Step 1: สร้าง Q, K, V จาก input x -----
@@ -448,13 +511,366 @@ for h in range(num_heads):
 print("=" * 70)
 
 # Tranformer Endcoder (BERT) and Decode (GPT)
-class FeedForWard:
-    def __init__(self, d_model, dimention_feedforward=None, seed=42):
+class FeedForward:
+    """
+    Position-wise FFN: FFN(x) = ReLU(xW1 + b1)W2 + b2
+    d_model → d_ff (ปกติ 4×d_model) → d_model
+    """
+    def __init__(self, d_model, d_ff=None, seed=42):
         rng = np.random.RandomState(seed)
-        dimention_feedforward = dimention_feedforward or d_model * 4
+        d_ff = d_ff or d_model * 4
         s = np.sqrt(2.0 / d_model)
-        s = np.sqrt(2.0 / d_model)
-        self.W1 = rng.randn(dimention_feedforward, d_model) * s       # (dimention_feedforward, d_model)
-        self.b1 = np.zeros(dimention_feedforward)
-        self.W2 = rng.randn(d_model, dimention_feedforward) * s       # (d_model, dimention_feedforward)
+        self.W1 = rng.randn(d_ff, d_model) * s       # (d_ff, d_model)
+        self.b1 = np.zeros(d_ff)
+        self.W2 = rng.randn(d_model, d_ff) * s       # (d_model, d_ff)
         self.b2 = np.zeros(d_model)
+
+    def forward(self, X):
+        h = np.maximum(0, X @ self.W1.T + self.b1)   # ReLU
+        return h @ self.W2.T + self.b2
+
+
+def layer_norm(X):
+    return (X - X.mean(axis=-1, keepdims=True)) / (X.std(axis=-1, keepdims=True) + 1e-8)
+
+
+# ============================================================
+# PART 2: Transformer Encoder Block (BERT-style)
+# ============================================================
+
+class TransformerEncoderBlock:
+    """
+    BERT-style Encoder Block — Pre-Norm Architecture (v3-1)
+
+    Forward Pass:
+        x1 = x + MHA( LayerNorm(x) )          ← Bidirectional (ไม่มี causal mask)
+        x2 = x1 + FFN( LayerNorm(x1) )
+        return x2
+
+    คุณสมบัติ Encoder:
+        - มองเห็นทุก token ทั้งซ้ายและขวา (Full Attention)
+        - เหมาะงาน: Classification, NER, Q&A (เหมือน BERT)
+    """
+
+    def __init__(self, d_model=32, n_heads=4, seed=42):
+        self.mha = MultiHeadAttentionSimple(d_model, n_heads, seed=seed)
+        self.ffn = FeedForward(d_model, seed=seed+1)
+
+    def forward(self, X, padding_mask=None, return_weights=False):
+        # Sub-layer 1: Multi-Head Attention (ไม่มี causal mask)
+        attn_out, hw = self.mha.forward(
+            X, padding_mask=padding_mask,
+            causal_mask=None,              # ← BERT: มองเห็นทุกทิศ
+            return_weights=return_weights
+        )
+        x1 = X + attn_out                 # Residual connection
+
+        # Sub-layer 2: FFN
+        x2 = x1 + self.ffn.forward(layer_norm(x1))
+
+        return x2, hw
+
+
+# ============================================================
+# PART 3: Transformer Decoder Block (GPT-style)
+# ============================================================
+
+class TransformerDecoderBlock:
+    """
+    GPT-style Decoder Block — Pre-Norm + Causal Mask (v3-1, v3-2)
+
+    Forward Pass:
+        x1 = x + MHA( LayerNorm(x), causal_mask=True )  ← มองได้แค่ซ้าย
+        x2 = x1 + FFN( LayerNorm(x1) )
+        return x2
+
+    คุณสมบัติ Decoder:
+        - token ที่ตำแหน่ง t มองได้เฉพาะ t0..t (ไม่มองอนาคต)
+        - เหมาะงาน: Text Generation (เหมือน GPT)
+    """
+
+    def __init__(self, d_model=32, n_heads=4, seed=42):
+        self.mha = MultiHeadAttentionSimple(d_model, n_heads, seed=seed)
+        self.ffn = FeedForward(d_model, seed=seed+1)
+
+    @staticmethod
+    def _causal_mask(T):
+        """Upper-triangular True = blocked (ดูสูตรใน TransformerEncoderVsDecoder.causal_mask)"""
+        return np.triu(np.ones((T, T), dtype=bool), k=1)
+
+    def forward(self, X, padding_mask=None, return_weights=False):
+        T = X.shape[0]
+        mask = self._causal_mask(T)        # (T, T) — เหมือนที่ w3 ใช้
+
+        # Sub-layer 1: Masked Multi-Head Attention (GPT: มองแค่ซ้าย)
+        attn_out, hw = self.mha.forward(
+            X, padding_mask=padding_mask,
+            causal_mask=mask,              # ← GPT: บัง token อนาคต
+            return_weights=return_weights
+        )
+        x1 = X + attn_out
+
+        # Sub-layer 2: FFN
+        x2 = x1 + self.ffn.forward(layer_norm(x1))
+
+        return x2, hw
+
+
+# ============================================================
+# PART 3.5: Encoder vs Decoder — เปรียบเทียบ Attention Mask
+# ============================================================
+
+class TransformerEncoderVsDecoder:
+    """
+    Utility class สำหรับเปรียบเทียบ attention mask ระหว่าง:
+      - Encoder (BERT) → Full attention (ทุก token เห็นกันได้หมด)
+      - Decoder (GPT)  → Causal mask (มองได้แค่ token ก่อนหน้า)
+    """
+    def __init__(self, d_model=32, n_heads=4, seed=42):
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.seed = seed
+
+    @staticmethod
+    def causal_mask(T):
+        # Upper-triangular True = blocked (เหมือนของ Decoder block)
+        return np.triu(np.ones((T, T), dtype=bool), k=1)
+
+    def print_comparison(self, T=4):
+        # Encoder: ไม่มี mask — เห็นกันหมด
+        print(f"\n  Encoder (BERT) — Full Attention (no mask):")
+        print(f"  pos  " + "".join(f"  t{j}" for j in range(T)))
+        for i in range(T):
+            print(f"   t{i}  " + "  v" * T)
+
+        # Decoder: causal mask
+        print(f"\n  Decoder (GPT) — Causal Mask:")
+        print(f"  pos  " + "".join(f"  t{j}" for j in range(T)))
+        cm = self.causal_mask(T)
+        for i in range(T):
+            row = "".join("  v" if not cm[i, j] else "  x" for j in range(T))
+            print(f"   t{i}  {row}")
+
+
+# ============================================================
+# PART 4: Mini BERT (Encoder-only, 2 layers)
+# ============================================================
+
+class MiniBERT:
+    """
+    BERT-style Encoder: Embed + PE → [EncoderBlock × n_layers] → mean pool → classify
+    ใช้ Full Attention ทุก layer
+    """
+
+    def __init__(self, input_size, d_model=32, n_heads=4, n_layers=2, n_classes=3, seed=42):
+        rng = np.random.RandomState(seed)
+        s = np.sqrt(2.0 / input_size)
+        self.W_proj = rng.randn(d_model, input_size) * s      # Embedding projection
+        self.pe = SinusoidalPositionEncoding(512, d_model)
+        self.layers = [
+            TransformerEncoderBlock(d_model, n_heads, seed=seed + i)
+            for i in range(n_layers)
+        ]
+        self.W_out = rng.randn(n_classes, d_model) * s
+        self.b_out = np.zeros((n_classes, 1))
+
+    @staticmethod
+    def _softmax(x):
+        e = np.exp(x - np.max(x))
+        return e / e.sum()
+
+    def forward(self, x_seq, padding_mask=None, return_weights=False):
+        X = x_seq @ self.W_proj.T                    # Project input
+        X = self.pe.encode(X)                        # บวก PE (เหมือน w3)
+
+        all_weights = []
+        for layer in self.layers:
+            X, hw = layer.forward(X, padding_mask=padding_mask,
+                                  return_weights=return_weights)
+            if return_weights:
+                all_weights.append(hw)
+
+        ctx = X.mean(axis=0)                         # Mean pooling
+        probs = self._softmax(
+            (self.W_out @ ctx.reshape(-1, 1) + self.b_out).flatten()
+        )
+        return probs, all_weights
+
+    def predict_batch(self, X, sl):
+        return np.array([np.argmax(self.forward(X[i].reshape(sl, -1))[0]) for i in range(len(X))])
+
+    def predict_proba(self, X, sl):
+        return np.array([self.forward(X[i].reshape(sl, -1))[0] for i in range(len(X))])
+
+
+# ============================================================
+# PART 5: Mini GPT (Decoder-only, 2 layers)
+# ============================================================
+
+class MiniGPT:
+    """
+    GPT-style Decoder: Embed + PE → [DecoderBlock × n_layers] → last token → next token pred
+    ใช้ Causal Mask ทุก layer (มองแค่ token ก่อนหน้า)
+    """
+
+    def __init__(self, input_size, d_model=32, n_heads=4, n_layers=2, seed=42):
+        rng = np.random.RandomState(seed)
+        s = np.sqrt(2.0 / input_size)
+        self.W_proj = rng.randn(d_model, input_size) * s
+        self.pe = SinusoidalPositionEncoding(512, d_model)
+        self.layers = [
+            TransformerDecoderBlock(d_model, n_heads, seed=seed + i)
+            for i in range(n_layers)
+        ]
+        # Language model head: predict next token (project back to input_size)
+        self.W_lm = rng.randn(input_size, d_model) * s
+
+    def forward(self, x_seq, return_weights=False):
+        X = x_seq @ self.W_proj.T
+        X = self.pe.encode(X)
+
+        all_weights = []
+        for layer in self.layers:
+            X, hw = layer.forward(X, return_weights=return_weights)
+            if return_weights:
+                all_weights.append(hw)
+
+        # GPT: ใช้เฉพาะ hidden state ของ token สุดท้ายในการทำนาย
+        last_hidden = X[-1]                          # (d_model,)
+        next_token_logits = self.W_lm @ last_hidden  # (input_size,)
+
+        return next_token_logits, all_weights
+
+
+# ============================================================
+# MAIN DEMO
+# ============================================================
+
+def print_section(title, char="="):
+    print(f"\n{char*58}\n  {title}\n{char*58}")
+
+
+def _print_heatmap(W, seq_len):
+    # พิมพ์ attention matrix (seq, seq) แบบอ่านง่าย
+    for i in range(seq_len):
+        print("  " + " ".join(f"{v: .3f}" for v in W[i]))
+
+
+def run_demo():
+    d_model   = 32
+    n_heads   = 4
+    seq_len   = 4
+    input_dim = 8      # ขนาด feature ต่อ token
+
+    rng = np.random.RandomState(0)
+    X_sample = rng.randn(seq_len, input_dim) * 0.1   # (4, 8) ทดสอบ
+
+    # ─── STEP 1: w3 TransformerEncoderVsDecoder (ของเดิม) ───────────
+    print_section("STEP 1: TransformerEncoderVsDecoder (จาก w3)")
+    ev = TransformerEncoderVsDecoder(d_model=d_model, n_heads=n_heads, seed=42)
+    ev.print_comparison(T=seq_len)
+
+    # ─── STEP 2: Encoder Block ───────────────────────────────────────
+    print_section("STEP 2: Encoder Block (BERT-style) — Full Attention")
+    enc_block = TransformerEncoderBlock(d_model=d_model, n_heads=n_heads, seed=42)
+
+    # Project input ก่อน (เหมือน MiniBERT)
+    W_proj = rng.randn(d_model, input_dim) * 0.1
+    pe = SinusoidalPositionEncoding(512, d_model)
+    X_emb = pe.encode(X_sample @ W_proj.T)
+
+    enc_out, enc_ws = enc_block.forward(X_emb, return_weights=True)
+    print(f"\n  Input  shape : {X_emb.shape}")
+    print(f"  Output shape : {enc_out.shape}  (shape เท่ากับ input — residual)")
+    print(f"\n  Encoder Head 1 — Full Attention (ทุก token มองเห็นกัน):")
+    _print_heatmap(enc_ws[0], seq_len)
+
+    # ─── STEP 3: Decoder Block ───────────────────────────────────────
+    print_section("STEP 3: Decoder Block (GPT-style) — Causal Mask")
+    dec_block = TransformerDecoderBlock(d_model=d_model, n_heads=n_heads, seed=42)
+    dec_out, dec_ws = dec_block.forward(X_emb, return_weights=True)
+
+    print(f"\n  Decoder Head 1 — Causal Masked (บัง token อนาคต):")
+    _print_heatmap(dec_ws[0], seq_len)
+
+    print(f"\n  Causal Mask pattern:")
+    mask = TransformerDecoderBlock._causal_mask(seq_len)
+    print("  pos  " + "".join(f"  t{j}" for j in range(seq_len)))
+    for i in range(seq_len):
+        row = "".join("  ✓" if not mask[i, j] else "  ✗" for j in range(seq_len))
+        print(f"   t{i}  {row}")
+
+    # ─── STEP 4: MiniBERT (2 layers) ─────────────────────────────────
+    print_section("STEP 4: MiniBERT — 2-Layer Encoder")
+    bert = MiniBERT(input_size=input_dim, d_model=d_model,
+                    n_heads=n_heads, n_layers=2, n_classes=3, seed=42)
+    probs, bert_ws = bert.forward(X_sample, return_weights=True)
+    print(f"\n  Class probabilities: {probs.round(4)}")
+    print(f"  Predicted class    : {np.argmax(probs)}")
+    print(f"\n  Layer 1 — Head 1 attention:")
+    _print_heatmap(bert_ws[0][0], seq_len)
+    print(f"\n  Layer 2 — Head 1 attention:")
+    _print_heatmap(bert_ws[1][0], seq_len)
+
+    # ─── STEP 5: MiniGPT (2 layers) ──────────────────────────────────
+    print_section("STEP 5: MiniGPT — 2-Layer Decoder")
+    gpt = MiniGPT(input_size=input_dim, d_model=d_model,
+                  n_heads=n_heads, n_layers=2, seed=42)
+    logits, gpt_ws = gpt.forward(X_sample, return_weights=True)
+    print(f"\n  Next-token logits (8 dims): {logits.round(4)}")
+    print(f"\n  Layer 1 — Head 1 attention (Causal):")
+    _print_heatmap(gpt_ws[0][0], seq_len)
+    print(f"\n  Layer 2 — Head 1 attention (Causal):")
+    _print_heatmap(gpt_ws[1][0], seq_len)
+
+
+# XAI Analysis ตีความค่า Weight Attention อธิบายได้ (Explainable) เพื่อดูว่าคำไหนมีความสำคัญในการตัดสินใจคดี
+def explainbleAttention(tokens, weight):
+    # ค่าเฉลียของ Head 0
+    avg_Weight = weight.mean(axis=0).mean(axis=0) 
+    print(f"=" *70)
+    print(f"XAI Legal Importance Analysis")
+    for i, token in enumerate(tokens):
+        # ตรวจสอบขนาดเพื่อป้องกัน IndexError
+        if i < len(avg_Weight):
+            importance = avg_Weight[i]
+            # หาก avg_Weight เป็น 2D ให้เฉลี่ยแถวนั้น
+            if hasattr(importance, "__len__"):
+                importance = importance.mean()
+            
+            bar = "|" * int(importance * 50)
+            print(f"  {token:<15} | {bar} ({importance:.3f})")
+    print(f"=" *70)
+
+tokens = ["จำเลย", "ละเมิด", "สิทธิบัตร", "การประดิษฐ์", "คดี", "ศาล"]
+
+# 1 Head - ปรับให้มี 6 ค่าตามจำนวน tokens
+mock_weight = np.array([[[0.1, 0.2, 0.3, 0.2, 0.1, 0.1]]])
+explainbleAttention(tokens, mock_weight)
+
+# กรณี - 3 Heads - ปรับให้มี 6 ค่าต่อ Head
+mock_3heads = np.array([[[0.1, 0.2, 0.3, 0.2, 0.1, 0.1],
+                         [0.2, 0.1, 0.2, 0.3, 0.1, 0.1],
+                         [0.1, 0.1, 0.1, 0.1, 0.3, 0.3]]])
+
+print(f"1 Head Shape (Batch, Head, Seq) {mock_weight.shape}")
+print(f"3 Heads Shape (Batch, Head, Seq) {mock_3heads.shape}")
+print("3 Heads AVG")
+explainbleAttention(tokens, mock_3heads)
+
+# PreNorm + MultiHead (Test Case สำหรับ 2D Input)
+print(f"4. PreNorm + MultiHead (2D Support)")
+print("="* 70)
+mha_test = MultiHeadAttention()
+simple_input = np.random.randn(4, 16) # Input แบบ 2 มิติ (Seq=4, Dim=16)
+
+# รับค่า 2 อย่าง (Output และ Weights) ตามที่เมธอดปรับปรุงใหม่ส่งกลับมา
+out_put, attn_ws = mha_test.forward(simple_input)
+
+print(f"InPut Shape  : {simple_input.shape}")
+print(f"OutPut Shape : {out_put.shape}")   # ควรเป็น (4, 16) เท่าเดิม
+print(f"Weights Shape: {attn_ws.shape}")  # ควรเป็น (4, 4, 4) -> (Heads, Seq, Seq)
+print("="* 70)
+
+
+
